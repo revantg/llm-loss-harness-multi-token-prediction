@@ -1,12 +1,14 @@
-# Session 9 · A loss harness you can read, plus one extra head
+# LLM loss harness + multi-token prediction, from scratch
 
-ERA V5, Session 9 assignment. A small GPT (8 layers, 8 heads, `D=256`, BPE vocabulary `V=8,192`, context `T=256`) trained on TinyStories. Part 1 makes the path from hidden state to scalar loss correct and observable. Part 2 adds a second output head that predicts token `t+2`.
+A small GPT (8 layers, 8 heads, `D=256`, BPE vocabulary `V=8,192`, context `T=256`) trained on TinyStories, used as a test bench for the few lines between `model(tokens)` and the scalar loss, where many silent training bugs live. Part 1 makes that path correct and observable: the shift, padding and packing masks, perplexity at init, tied vs untied heads, and a chunked cross-entropy that cuts the loss's peak memory 12.8×. Part 2 adds a DeepSeek-V3-style second output head that predicts token `t+2`, and measures what it costs and what it buys.
+
+*Built as the Session 9 assignment of The School of AI's ERA V5 course.*
 
 | | |
 |---|---|
-| **Notebook (runs top to bottom, outputs saved)** | [`loss_harness.ipynb`](loss_harness.ipynb) · [Open in Colab](https://colab.research.google.com/github/revantg/era-v5-session9-loss-harness/blob/main/loss_harness.ipynb) |
+| **Notebook (runs top to bottom, outputs saved)** | [`loss_harness.ipynb`](loss_harness.ipynb) · [Open in Colab](https://colab.research.google.com/github/revantg/llm-loss-harness-multi-token-prediction/blob/main/loss_harness.ipynb) |
 | marimo source (the notebook was built in marimo) | [`loss_harness.py`](loss_harness.py) |
-| Interactive HTML export | [`exports/loss_harness.html`](exports/loss_harness.html) · [view rendered](https://revantg.github.io/era-v5-session9-loss-harness/exports/loss_harness.html) |
+| Interactive HTML export | [`exports/loss_harness.html`](exports/loss_harness.html) · [view rendered](https://revantg.github.io/llm-loss-harness-multi-token-prediction/exports/loss_harness.html) |
 | Other exports (Git LFS) | [`exports/`](exports/): PDF, full-page PNG, marimo `.ipynb`, Markdown, JSON |
 
 Hardware for the reported run: NVIDIA RTX PRO 6000 Blackwell (95 GiB), bf16 autocast, 5,000 optimizer steps per training run, `B=64`. Each 5,000-step run takes about 1.5–2 minutes on that GPU.
