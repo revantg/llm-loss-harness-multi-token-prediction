@@ -1,0 +1,416 @@
+{
+  "version": "1",
+  "metadata": {
+    "marimo_version": "0.25.1"
+  },
+  "cells": [
+    {
+      "id": "URmI",
+      "name": "intro",
+      "code": "mo.md(r\"\"\"\n# Session 9 · A loss harness you can read, plus one extra head\n\nA small GPT (10.7M parameters, TinyStories, a BPE vocabulary of 8,192) used as a test bench for the few lines between `model(tokens)` and the scalar loss.\n\n* **Part 1** makes the starter harness correct and observable: every shape, the shift printed as strings, padding, packing, perplexity at init, tied vs untied heads, and the peak memory of ordinary vs chunked cross-entropy.\n* **Part 2** adds a second head that predicts token `t+2` and follows both losses through training.\n\nThe scale-down keeps V5's ratio: `V / D = 8192 / 256 = 32`, the same as `131072 / 4096 = 32`, so the logits tensor is 32× the hidden state that produced it here too.\n\nThe write-up with the seven Part 1 numbers and the two Part 2 losses is the last cell.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "rdxB",
+      "name": "imports",
+      "code": "import marimo as mo\nimport math, time, os, base64, warnings, logging\nfrom dataclasses import dataclass, replace\nimport numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F\nimport pyarrow.parquet as pq\nimport matplotlib.pyplot as plt\nfrom huggingface_hub import hf_hub_download\nfrom tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders\n\nos.environ[\"HF_HUB_DISABLE_PROGRESS_BARS\"] = \"1\"\nwarnings.filterwarnings(\"ignore\")\nlogging.getLogger(\"huggingface_hub\").setLevel(logging.ERROR)\nplt.rcParams.update({\"figure.dpi\": 110, \"axes.spines.top\": False, \"axes.spines.right\": False})\n\n\ndef svg(name):\n    \"\"\"Embed a figure from ./figures as a data URI, so the HTML export is self-contained.\"\"\"\n    _b = base64.b64encode((mo.notebook_dir() / \"figures\" / f\"{name}.svg\").read_bytes()).decode()\n    return mo.Html(f'<img src=\"data:image/svg+xml;base64,{_b}\" style=\"width:100%;max-width:1150px\">')",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "GNxN",
+      "name": "config",
+      "code": "@dataclass(frozen=True)\nclass Cfg:\n    V: int = 8192       # vocabulary size\n    T: int = 256        # context length\n    d: int = 256        # model width\n    L: int = 8          # transformer blocks\n    h: int = 8          # attention heads\n    ff: int = 704       # SwiGLU hidden width (2/3 * 4d, rounded to 64)\n    n_future: int = 1   # output heads: head k predicts token t+k\n    tie: bool = False   # head 1 reuses tok_emb\n\n\nCFG = Cfg()\nB, STEPS, LR = 64, 5000, 2e-3\nTOK_STORIES, TRAIN_STORIES, VAL_STORIES = 100_000, 400_000, 4_000\ndev = \"cuda\" if torch.cuda.is_available() else \"cpu\"\nAMP = dict(device_type=dev, dtype=torch.bfloat16, enabled=dev == \"cuda\")\n\n_g = torch.cuda.get_device_properties(0) if dev == \"cuda\" else None\nmo.md(f\"\"\"\n**Hardware** · {_g.name if _g else \"CPU\"} · {(_g.total_memory / 2**30) if _g else 0:.0f} GiB · torch {torch.__version__} · {os.cpu_count()} CPUs\n\n**Config** · `B={B}  T={CFG.T}  D={CFG.d}  layers={CFG.L}  heads={CFG.h}  V={CFG.V}` · {STEPS:,} optimizer steps per training run · bf16 autocast\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "PNLn",
+      "name": "data_md",
+      "code": "mo.md(r\"\"\"\n## Data and tokenizer\n\nTinyStories, one parquet shard. A byte-level BPE with two special tokens: `<pad>` = 0 and `<eos>` = 1. Every story ends in `<eos>`, then all the stories are concatenated into one stream, and training windows are cut from that stream at random. A window usually contains more than one story, which is the packing that Part 1 item 4 has to handle.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "nbxq",
+      "name": "data",
+      "code": "def _read(fname, n):\n    _path = hf_hub_download(\"roneneldan/TinyStories\", fname, repo_type=\"dataset\")\n    return [t.strip() for t in pq.read_table(_path, columns=[\"text\"]).slice(0, n).column(\"text\").to_pylist()]\n\n\n_t0 = time.time()\n_train_text = _read(\"data/train-00000-of-00004-2d5a1467fff1081b.parquet\", TRAIN_STORIES)\n_val_text = _read(\"data/validation-00000-of-00001-869c898b519ad725.parquet\", VAL_STORIES)\n\ntok = Tokenizer(models.BPE())\ntok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)\ntok.decoder = decoders.ByteLevel()\ntok.train_from_iterator(_train_text[:TOK_STORIES], trainers.BpeTrainer(\n    vocab_size=CFG.V, special_tokens=[\"<pad>\", \"<eos>\"],\n    initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False))\nPAD, EOS = tok.token_to_id(\"<pad>\"), tok.token_to_id(\"<eos>\")\nassert tok.get_vocab_size() == CFG.V and (PAD, EOS) == (0, 1)\n\n_train_docs = [e.ids + [EOS] for e in tok.encode_batch(_train_text)]\nval_docs = [e.ids + [EOS] for e in tok.encode_batch(_val_text)]\nstory_lens = np.array([len(d) for d in _train_docs])\n\n\ndef _stream(docs):\n    return torch.from_numpy(np.concatenate([np.asarray(d, dtype=np.int64) for d in docs])).to(dev)\n\n\ntrain_ids, val_ids = _stream(_train_docs), _stream(val_docs)\nmo.md(f\"\"\"\n| | stories | tokens |\n|---|---:|---:|\n| train stream | {len(story_lens):,} | {len(train_ids):,} |\n| validation stream | {len(val_docs):,} | {len(val_ids):,} |\n\nTokenizer `V={tok.get_vocab_size():,}`, `<pad>={PAD}`, `<eos>={EOS}`, trained on {TOK_STORIES:,} stories. Data and tokenizer took {time.time() - _t0:.0f}s.\nStory length (tokens, including `<eos>`): median {int(np.median(story_lens))}, p90 {int(np.percentile(story_lens, 90))}. A {CFG.T}-token training run of {STEPS:,} × {B} windows reads {STEPS * B * CFG.T / len(train_ids):.2f} epochs of the stream.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "bFVS",
+      "name": "batching",
+      "code": "def tstr(i):\n    \"\"\"One token id as a readable string: ␣ marks a leading space, ↵ a newline.\"\"\"\n    i = int(i)\n    return \"<pad>\" if i == PAD else \"<eos>\" if i == EOS else tok.decode([i]).replace(\" \", \"␣\").replace(\"\\n\", \"↵\")\n\n\ndef doc_index(x):\n    \"\"\"Story index per position, counting from 0 within the row. <eos> belongs to the story it ends.\"\"\"\n    eos = (x == EOS).long()\n    return eos.cumsum(1) - eos\n\n\ndef get_batch(ids, gen, bs=B):\n    \"\"\"Random T-token windows cut from the packed stream, plus their story index.\"\"\"\n    ix = torch.randint(len(ids) - CFG.T, (bs,), generator=gen).to(ids.device)\n    x = ids[ix[:, None] + torch.arange(CFG.T, device=ids.device)]\n    return x, doc_index(x)\n\n\ndef story_spans(ids):\n    ends = (ids == EOS).nonzero().squeeze(1)\n    starts = torch.cat([ends.new_zeros(1), ends[:-1] + 1])\n    return starts, ends - starts + 1\n\n\ndef get_padded(ids, spans, idx):\n    \"\"\"One whole story per row (cut at T), right-padded with <pad>.\"\"\"\n    starts, lengths = spans\n    ar = torch.arange(CFG.T, device=ids.device)\n    pos = (starts[idx, None] + ar).clamp(max=len(ids) - 1)\n    return torch.where(ar < lengths[idx, None], ids[pos], PAD)\n\n\ntrain_spans, val_spans = story_spans(train_ids), story_spans(val_ids)\nassert len(val_spans[0]) == len(val_docs)\n_x, _d = get_batch(val_ids, torch.Generator().manual_seed(0))\nmo.md(f\"`get_batch` returns `{list(_x.shape)}` windows; a random window holds **{(_d[:, -1] + 1).float().mean().item():.2f}** stories on average. \"\n      f\"`get_padded` builds the padded alternative: one story per row, right-padded with `<pad>`. First validation story starts: `{' '.join(tstr(i) for i in val_docs[0][:10])}`\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "mjAD",
+      "name": "model_md",
+      "code": "mo.vstack([mo.md(r\"\"\"\n## The model\n\nA pre-norm GPT: learned positions, RMSNorm, causal self-attention, SwiGLU. `forward` returns the **hidden state** and stops there, because the heads belong to the loss side of the code. `n_future` sets how many heads there are, and head `k` predicts token `t+k`.\n\nAttention is **document-aware**: a position attends only to earlier positions in the same story. The loss mask at story boundaries (below) has to agree with this.\n\"\"\"), svg(\"model\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": true
+      }
+    },
+    {
+      "id": "DnOc",
+      "name": "model",
+      "code": "class Block(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.h = c.h\n        self.n1, self.n2 = nn.RMSNorm(c.d), nn.RMSNorm(c.d)\n        self.qkv = nn.Linear(c.d, 3 * c.d, bias=False)\n        self.proj = nn.Linear(c.d, c.d, bias=False)\n        self.gate_up = nn.Linear(c.d, 2 * c.ff, bias=False)\n        self.down = nn.Linear(c.ff, c.d, bias=False)\n\n    def forward(self, x, mask):\n        Bn, T, D = x.shape\n        q, k, v = self.qkv(self.n1(x)).view(Bn, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)\n        a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\n        x = x + self.proj(a.transpose(1, 2).reshape(Bn, T, D))\n        g, u = self.gate_up(self.n2(x)).chunk(2, dim=-1)\n        return x + self.down(F.silu(g) * u)\n\n\nclass GPT(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.c = c\n        self.tok_emb = nn.Embedding(c.V, c.d)\n        self.pos_emb = nn.Embedding(c.T, c.d)\n        self.blocks = nn.ModuleList(Block(c) for _ in range(c.L))\n        self.norm = nn.RMSNorm(c.d)\n        self.heads = nn.ModuleList(nn.Linear(c.d, c.V, bias=False) for _ in range(c.n_future))\n        for name, p in self.named_parameters():\n            if p.dim() == 2:\n                std = 0.02 / math.sqrt(2 * c.L) if name.endswith((\"proj.weight\", \"down.weight\")) else 0.02\n                nn.init.normal_(p, 0.0, std)\n        if c.tie:\n            self.heads[0].weight = self.tok_emb.weight\n\n    def forward(self, tokens, doc=None):\n        T = tokens.size(1)\n        causal = torch.ones(T, T, dtype=torch.bool, device=tokens.device).tril()\n        mask = causal if doc is None else (causal & (doc[:, :, None] == doc[:, None, :]))[:, None]\n        x = self.tok_emb(tokens) + self.pos_emb(torch.arange(T, device=tokens.device))\n        for blk in self.blocks:\n            x = blk(x, mask)\n        return self.norm(x)\n\n\ndef n_params(m):\n    return sum(p.numel() for p in m.parameters())  # parameters() yields a tied tensor once",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "vvTl",
+      "name": "harness_md",
+      "code": "mo.vstack([mo.md(r\"\"\"\n## The harness\n\nThe starter code from the assignment, with one generalisation: `k` is how far ahead the target is (`k=1` is the next token, `k=2` is Part 2's second head).\n\n* **Targets** are `tokens[:, k:]`, lined up with `logits[:, :-k]`. A target becomes `-100` (`ignore_index`) when it is `<pad>`, or when it belongs to a different story than the position predicting it.\n* **The mean** is the summed loss divided by the number of targets that actually count, not by `B × (T-k)`.\n\"\"\"), svg(\"targets\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": true
+      }
+    },
+    {
+      "id": "hnhA",
+      "name": "harness",
+      "code": "IGNORE = -100\n\n\ndef make_targets(tokens, k=1, doc=None, pad_id=None):\n    \"\"\"targets[b, t] = tokens[b, t+k], or IGNORE when that is not a real prediction. Shape [B, T-k].\"\"\"\n    tgt = tokens[:, k:].clone()\n    if pad_id is not None:\n        tgt[tgt == pad_id] = IGNORE              # a <pad> target is not a prediction\n    if doc is not None:\n        tgt[doc[:, k:] != doc[:, :-k]] = IGNORE  # the target lives in the next story\n    return tgt\n\n\ndef lm_loss(logits, tokens, k=1, doc=None, pad_id=None):\n    \"\"\"Mean cross-entropy over the counted targets. Returns (loss, number of counted targets).\"\"\"\n    V = logits.size(-1)\n    tgt = make_targets(tokens, k, doc, pad_id)\n    total = F.cross_entropy(logits[:, :-k].reshape(-1, V).float(), tgt.reshape(-1),\n                            ignore_index=IGNORE, reduction=\"sum\")\n    n = (tgt != IGNORE).sum()\n    return total / n, int(n)",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "qsJw",
+      "name": "p1_md",
+      "code": "mo.md(r\"\"\"\n# Part 1 · The harness, made correct and observable\n\nEvery measurement in this part uses one **untrained** model (`model0`: untied, one head) and one fixed validation batch. Items 3 and 4 are run again on the trained models after Part 2.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "sauj",
+      "name": "model0",
+      "code": "torch.manual_seed(0)\nmodel0 = GPT(CFG).to(dev)\nxb, docb = get_batch(val_ids, torch.Generator().manual_seed(0))\nN = B * (CFG.T - 1)",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "zScw",
+      "name": "item1",
+      "code": "with torch.no_grad():\n    _hidden = model0(xb, docb)\n    _logits = model0.heads[0](_hidden)\n    _tgt = make_targets(xb, 1, docb, PAD)\n    _loss, n_counted = lm_loss(_logits, xb, 1, docb, PAD)\n\nshapes_df = pd.DataFrame([\n    (\"tokens\", xb, \"B rows of T token ids\"),\n    (\"doc\", docb, \"story index for each token; increments after every <eos>\"),\n    (\"hidden = model(tokens)\", _hidden, \"one D-wide vector per position: the residual stream after the final RMSNorm\"),\n    (\"head.weight\", model0.heads[0].weight, \"V rows of width D: one output embedding per vocabulary entry\"),\n    (\"logits = head(hidden)\", _logits, \"a score for every vocabulary entry at every position\"),\n    (\"logits[:, :-1]\", _logits[:, :-1], \"drop the last position: nothing inside the window follows it\"),\n    (\"tokens[:, 1:]\", _tgt, \"drop the first token: no position predicts it\"),\n    (\"logits[:, :-1].reshape(-1, V)\", _logits[:, :-1].reshape(-1, CFG.V), \"B·(T-1) predictions, each a distribution over V\"),\n    (\"tokens[:, 1:].reshape(-1)\", _tgt.reshape(-1), \"B·(T-1) target ids; -100 where masked\"),\n    (\"loss\", _loss, \"one scalar: the mean over counted targets\"),\n], columns=[\"tensor\", \"t\", \"what each dimension is\"])\nshapes_df.insert(1, \"shape\", [str(list(t.shape)) for t in shapes_df.pop(\"t\")])\nmo.vstack([mo.md(\"## 1 · Every tensor shape\"), shapes_df,\n           mo.md(f\"`B={B}  T={CFG.T}  D={CFG.d}  V={CFG.V}` → `B·(T-1) = {N:,}` predictions, of which **{n_counted:,}** count \"\n                 f\"(the other {N - n_counted} are story-boundary targets, see item 4).\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "szOK",
+      "name": "item2",
+      "code": "def shift_table(x, doc, row, start, n):\n    t1, t2 = make_targets(x, 1, doc, PAD)[row], make_targets(x, 2, doc, PAD)[row]\n\n    def show(tg, t, k):\n        if t >= len(tg):\n            return \"—\"\n        return f\"✗ {tstr(x[row, t + k])}\" if tg[t] == IGNORE else tstr(tg[t])\n\n    return pd.DataFrame([{\"t\": t, \"input tokens[t]\": tstr(x[row, t]), \"head 1 target · tokens[t+1]\": show(t1, t, 1),\n                          \"head 2 target · tokens[t+2]\": show(t2, t, 2)} for t in range(start, start + n)])\n\n\n_hit = (xb[1:, 3:CFG.T - 4] == EOS).nonzero()[0]\n_r, _b = int(_hit[0]) + 1, int(_hit[1]) + 3\nmo.vstack([\n    mo.md(\"## 2 · The shift, read as strings\\n\\nInputs on the left, targets on the right. Reading across a row gives an input token, then the token that follows it in the text. `✗` marks a masked target (it belongs to the next story).\"),\n    mo.md(\"**Row 0, first 12 positions**\"), shift_table(xb, docb, 0, 0, 12),\n    mo.md(f\"**Row {_r}, across a story boundary** (the `<eos>` is at t={_b})\"), shift_table(xb, docb, _r, _b - 3, 7),\n    mo.md(f\"\"\"The same six positions as raw ids, which is where an off-by-one hides:\n\n```\ninputs  {xb[_r, _b - 3:_b + 3].tolist()}\ntargets {make_targets(xb, 1, docb, PAD)[_r, _b - 3:_b + 3].tolist()}\n```\"\"\"),\n])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "Iqev",
+      "name": "item3",
+      "code": "pad_x = get_padded(val_ids, val_spans, torch.arange(100, 100 + B, device=dev))\n\n\n@torch.no_grad()\ndef padding_report(model, x=pad_x):\n    with torch.autocast(**AMP):\n        lg = model.heads[0](model(x, doc_index(x))).float()\n    total_all = F.cross_entropy(lg[:, :-1].reshape(-1, CFG.V), x[:, 1:].reshape(-1), reduction=\"sum\")\n    n_all = x[:, 1:].numel()\n    masked, n_real = lm_loss(lg, x, 1, None, PAD)\n    return {\"targets counted\": (n_all, n_real, n_all),\n            \"loss\": ((total_all / n_all).item(), masked.item(), (masked * n_real / n_all).item())}\n\n\ndef padding_frame(rep):\n    return pd.DataFrame(rep, index=[\"unmasked: <pad> targets count\", \"masked ÷ counted (correct)\", \"masked ÷ B·(T-1) (wrong denominator)\"])\n\n\npad_untrained = padding_report(model0)\nmo.vstack([\n    mo.md(f\"\"\"## 3 · Padding\n\nA batch of {B} whole validation stories, one per row, right-padded with `<pad>` to `T={CFG.T}`. **{(pad_x == PAD).float().mean().item():.1%}** of positions are `<pad>`. The same logits are scored three ways.\"\"\"),\n    padding_frame(pad_untrained),\n    mo.md(f\"Masking drops the contributing-token count from **{pad_untrained['targets counted'][0]:,} to {pad_untrained['targets counted'][1]:,}**. \"\n          f\"At initialisation every target costs about `ln V = {math.log(CFG.V):.3f}`, so the masked and unmasked means are close. \"\n          f\"The wrong denominator is the one that lies: it reports {pad_untrained['loss'][2]:.3f}, scaled by the real fraction of the batch \"\n          f\"({pad_untrained['targets counted'][1] / pad_untrained['targets counted'][0]:.1%}), which changes from batch to batch. The trained-model version is after Part 2.\"),\n])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "SNQu",
+      "name": "item4",
+      "code": "def packed_batch(docs, bs=B):\n    rows, j = [], 0\n    while len(rows) < bs:\n        a, b_ = docs[j], docs[j + 1]\n        j += 2\n        if len(a) < CFG.T - 32 and len(a) + len(b_) >= CFG.T:\n            rows.append((a + b_)[:CFG.T])\n    return torch.tensor(rows, device=dev)\n\n\npack_x = packed_batch(val_docs[1000:])\npack_doc = doc_index(pack_x)\nassert (pack_doc[:, -1] == 1).all()  # exactly two stories in every row\n\n\n@torch.no_grad()\ndef packing_report(model, x=pack_x, doc=pack_doc):\n    out = {}\n    with torch.autocast(**AMP):\n        h = model(x, doc)\n    for k, head in enumerate(model.heads, 1):\n        with torch.autocast(**AMP):\n            lg = head(h).float()\n        before, n_b = lm_loss(lg, x, k, None, PAD)\n        after, n_a = lm_loss(lg, x, k, doc, PAD)\n        per_pos = F.cross_entropy(lg[:, :-k].transpose(1, 2), x[:, k:], reduction=\"none\")  # [B, T-k]\n        cross = doc[:, k:] != doc[:, :-k]\n        out[f\"head {k}\"] = {\"targets counted, boundary not masked\": n_b, \"targets counted, boundary masked\": n_a,\n                            \"loss, boundary not masked\": before.item(), \"loss, boundary masked\": after.item(),\n                            \"mean loss of the boundary targets alone\": per_pos[cross].mean().item(),\n                            \"mean loss of every other target\": per_pos[~cross].mean().item()}\n    return pd.DataFrame(out)\n\n\npack_untrained = packing_report(model0)\n_b0 = int((pack_x[0] == EOS).nonzero()[0])\nmo.vstack([\n    mo.md(f\"\"\"## 4 · Packing two stories into one sequence\n\nEach row is story A, its `<eos>`, then story B cut off at `T`: two stories and one boundary per row, {B} rows. The loss is scored with and without the boundary mask. Attention is document-aware in both, so the only thing that changes is which targets count.\"\"\"),\n    mo.md(\"**Row 0 around the boundary**\"), shift_table(pack_x, pack_doc, 0, _b0 - 2, 5),\n    pack_untrained,\n    mo.md(f\"Masking removes exactly one target per row ({B} in all), the `<eos> → first token of story B` pair. \"\n          f\"Untrained, that target costs about as much as any other (every target costs ≈ `ln V`), so the loss barely moves: \"\n          f\"{pack_untrained.loc['loss, boundary not masked', 'head 1']:.4f} → {pack_untrained.loc['loss, boundary masked', 'head 1']:.4f}. \"\n          \"The difference only shows up once the model has learned something, and that is measured after training.\"),\n])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "uAwS",
+      "name": "item5",
+      "code": "@torch.no_grad()\ndef evaluate(model, ids=val_ids, n_batches=20, seed=123):\n    \"\"\"Per-head mean loss (masked correctly) and top-1 accuracy on fixed validation windows.\"\"\"\n    g = torch.Generator().manual_seed(seed)\n    nh = len(model.heads)\n    tot, hit, cnt = (torch.zeros(nh, device=dev) for _ in range(3))\n    for _ in range(n_batches):\n        x, doc = get_batch(ids, g)\n        with torch.autocast(**AMP):\n            h = model(x, doc)\n        for k, head in enumerate(model.heads, 1):\n            with torch.autocast(**AMP):\n                lg = head(h).float()[:, :-k]\n            tgt = make_targets(x, k, doc, PAD)\n            keep = tgt != IGNORE\n            tot[k - 1] += F.cross_entropy(lg.reshape(-1, CFG.V), tgt.reshape(-1), ignore_index=IGNORE, reduction=\"sum\")\n            hit[k - 1] += (lg.argmax(-1)[keep] == tgt[keep]).sum()\n            cnt[k - 1] += keep.sum()\n    return (tot / cnt).tolist(), (hit / cnt).tolist()\n\n\n(l0,), _ = evaluate(model0)\nppl0 = math.exp(l0)\nwith torch.no_grad():\n    _std = model0.heads[0](model0(xb, docb)).float().std().item()\nassert abs(l0 - math.log(CFG.V)) < 0.25, \"untrained loss is far from ln V: inspect the harness before training\"\nmo.md(f\"\"\"## 5 · Perplexity of the untrained model\n\n| | value |\n|---|---:|\n| untrained validation loss | **{l0:.4f}** nats |\n| `ln V = ln {CFG.V}` | {math.log(CFG.V):.4f} |\n| untrained perplexity `exp(loss)` | **{ppl0:,.0f}** |\n| vocabulary size `V` | {CFG.V:,} |\n| ratio | {ppl0 / CFG.V:.3f} |\n\nThe untrained model sits at {ppl0 / CFG.V:.1%} of `V`, which is what a near-uniform guess over the vocabulary looks like. It is slightly above `V` because the logits at init are not exactly zero: their std is {_std:.3f}, and random Gaussian logits with std σ give perplexity ≈ `V·exp(σ²/2)` = {CFG.V * math.exp(_std ** 2 / 2):,.0f}. The `assert` in this cell stops the notebook if the loss is not near `ln V`.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "hqBM",
+      "name": "item6",
+      "code": "_tied, _untied, _two = GPT(replace(CFG, tie=True)), GPT(CFG), GPT(replace(CFG, n_future=2))\nassert _tied.heads[0].weight.data_ptr() == _tied.tok_emb.weight.data_ptr()\nhead_params = CFG.V * CFG.d\ncounts = {\"tied\": n_params(_tied), \"untied\": n_params(_untied), \"untied + head 2\": n_params(_two), \"block\": n_params(_untied.blocks[0])}\nmo.md(f\"\"\"## 6 · Tied vs untied head\n\n| configuration | parameters |\n|---|---:|\n| tied (head 1 *is* `tok_emb`) | **{counts['tied']:,}** |\n| untied | **{counts['untied']:,}** |\n| untied + head 2 (Part 2) | {counts['untied + head 2']:,} |\n\nOne head is `V·D = {CFG.V}·{CFG.d} = {head_params:,}` parameters. Tying saves exactly that: **{head_params / counts['untied']:.1%}** of the untied model.\nOne head is also {head_params / counts['block']:.1f}× a whole transformer block ({counts['block']:,}), so the output side matters even at this size. Every other run in this notebook is untied: Part 2's second head needs its own matrix anyway, and V5 has no input table to tie to.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "ofdY",
+      "name": "item7_md",
+      "code": "mo.vstack([mo.md(r\"\"\"\n## 7 · Peak memory: ordinary vs chunked cross-entropy\n\n`ChunkedCE` is written from scratch as an `autograd.Function`. In the forward pass it computes the logits for 1,024 rows at a time, adds that chunk's loss to a running sum, and throws the logits away. In the backward pass it recomputes each chunk's logits and turns them into `softmax − onehot` straight away. Only `h`, `W` and `y` are saved for backward, so the full `[N, V]` tensor never exists.\n\nBoth versions get the same `h` (`N = B·(T-1)` rows), the same `W` and the same targets. Peak memory is the highest CUDA allocation above the inputs during `forward + backward`, in fp32.\n\"\"\"), svg(\"chunked-ce\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "tYKR",
+      "name": "item7",
+      "code": "class ChunkedCE(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, h, W, y, chunk):\n        total = torch.zeros((), device=h.device, dtype=torch.float32)\n        for i in range(0, h.size(0), chunk):\n            z = (h[i:i + chunk] @ W.T).float()                  # [chunk, V], freed next iteration\n            total += F.cross_entropy(z, y[i:i + chunk], ignore_index=IGNORE, reduction=\"sum\")\n        n = (y != IGNORE).sum().clamp(min=1)\n        ctx.save_for_backward(h, W, y, n)\n        ctx.chunk = chunk\n        return total / n\n\n    @staticmethod\n    def backward(ctx, g):\n        h, W, y, n = ctx.saved_tensors\n        dh, dW = torch.empty_like(h), torch.zeros_like(W)\n        for i in range(0, h.size(0), ctx.chunk):\n            hc, yc = h[i:i + ctx.chunk], y[i:i + ctx.chunk]\n            p = torch.softmax((hc @ W.T).float(), dim=-1)       # recompute this chunk's logits\n            keep = yc != IGNORE\n            p[keep, yc[keep]] -= 1.0                             # softmax - onehot\n            p[~keep] = 0.0\n            p = (p * (g / n)).to(h.dtype)\n            dh[i:i + ctx.chunk] = p @ W\n            dW += p.T @ hc\n        return dh, dW, None, None\n\n\ndef chunked_ce(h, W, y, chunk=1024):\n    return ChunkedCE.apply(h, W, y, chunk)\n\n\ndef ordinary_ce(h, W, y):\n    return F.cross_entropy(h @ W.T, y, ignore_index=IGNORE)\n\n\ndef ce_inputs(n, seed=0):\n    g = torch.Generator(device=dev).manual_seed(seed)\n    h = torch.randn(n, CFG.d, device=dev, generator=g).requires_grad_()\n    W = (0.02 * torch.randn(CFG.V, CFG.d, device=dev, generator=g)).requires_grad_()\n    y = torch.randint(0, CFG.V, (n,), device=dev, generator=g)\n    y[::17] = IGNORE  # some masked targets, so the ignore path is exercised too\n    return h, W, y\n\n\ndef measure(fn, h, W, y):\n    \"\"\"(loss, peak MiB above the inputs, seconds, dh, dW) for one forward + backward.\"\"\"\n    h.grad = W.grad = None\n    torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()\n    base = torch.cuda.memory_allocated()\n    t = time.time()\n    loss = fn(h, W, y)\n    loss.backward()\n    torch.cuda.synchronize()\n    return loss.item(), (torch.cuda.max_memory_allocated() - base) / 2**20, time.time() - t, h.grad.clone(), W.grad.clone()\n\n\n_h, _W, _y = ce_inputs(N)\nmeasure(ordinary_ce, _h, _W, _y); measure(chunked_ce, _h, _W, _y)  # warm-up\n_lo, _po, _to, _gho, _gWo = measure(ordinary_ce, _h, _W, _y)\n_lc, _pc, _tc, _ghc, _gWc = measure(chunked_ce, _h, _W, _y)\n_dl, _dh, _dW = abs(_lo - _lc), (_gho - _ghc).abs().max().item(), (_gWo - _gWc).abs().max().item()\nassert _dl < 1e-4 and _dh < 1e-5 and _dW < 1e-5\nmem = {\"ordinary MiB\": _po, \"chunked MiB\": _pc, \"ratio\": _po / _pc, \"ordinary ms\": _to * 1e3, \"chunked ms\": _tc * 1e3}\ndel _h, _W, _y, _gho, _gWo, _ghc, _gWc\n\nmo.md(f\"\"\"**At this notebook's configuration** · `N = B·(T-1) = {N:,}` rows, `D={CFG.d}`, `V={CFG.V:,}`. One fp32 `[N, V]` logits tensor is {N * CFG.V * 4 / 2**20:,.0f} MiB.\n\n| | loss | peak memory | time |\n|---|---:|---:|---:|\n| ordinary `F.cross_entropy(h @ W.T, y)` | {_lo:.6f} | **{_po:,.1f} MiB** | {_to * 1e3:.1f} ms |\n| chunked, 1,024 rows per chunk | {_lc:.6f} | **{_pc:,.1f} MiB** | {_tc * 1e3:.1f} ms |\n| ratio | | **{_po / _pc:.1f}× less** | {_tc / _to:.2f}× the time |\n\nSame objective: `|Δloss| = {_dl:.1e}`, `max|Δ dh| = {_dh:.1e}`, `max|Δ dW| = {_dW:.1e}`. The ordinary path keeps about three `[N, V]`-sized buffers alive at once (logits, the saved log-softmax, and their gradient). The chunked path keeps one `[1024, V]` chunk plus a few softmax temporaries.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "smZa",
+      "name": "item7_sweep",
+      "code": "_rows = []\nfor _bs in [16, 64, 256, 1024]:\n    _n = _bs * (CFG.T - 1)\n    _h, _W, _y = ce_inputs(_n)\n    _lo, _po, _to, *_r1 = measure(ordinary_ce, _h, _W, _y)\n    _lc, _pc, _tc, *_r2 = measure(chunked_ce, _h, _W, _y)\n    _rows.append({\"B\": _bs, \"N = B·(T-1)\": _n, \"ordinary MiB\": _po, \"chunked MiB\": _pc, \"ratio\": _po / _pc,\n                  \"ordinary ms\": _to * 1e3, \"chunked ms\": _tc * 1e3, \"|Δloss|\": abs(_lo - _lc)})\n    del _h, _W, _y, _r1, _r2\nsweep_df = pd.DataFrame(_rows)\n\n_fig, _ax = plt.subplots(figsize=(7.5, 3.6))\n_ax.loglog(sweep_df[\"N = B·(T-1)\"], sweep_df[\"ordinary MiB\"], \"o-\", color=\"#e11d48\", label=\"ordinary\")\n_ax.loglog(sweep_df[\"N = B·(T-1)\"], sweep_df[\"chunked MiB\"], \"o-\", color=\"#059669\", label=\"chunked (1,024 rows)\")\n_ax.axvline(N, color=\"gray\", ls=\":\", lw=1)\n_ax.text(N * 1.08, sweep_df[\"chunked MiB\"].min() * 1.2, \"this notebook\", color=\"gray\")\n_ax.set(xlabel=\"rows N\", ylabel=\"peak MiB (fp32, fwd+bwd)\", title=\"Peak memory of the loss vs number of rows\")\n_ax.legend()\n_fig.tight_layout()\nmo.vstack([mo.md(\"**Sweep over batch size**: the ordinary path grows with `N·V`. The chunked path grows only with `N·D` (`h` and `dh`), plus a constant `chunk·V`.\"),\n           sweep_df.round(3), _fig])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "kgTm",
+      "name": "train_md",
+      "code": "mo.md(r\"\"\"\n# Training: guard runs, then one head vs two\n\n* **Guard 1, the off-by-one.** The same model trained on the *unshifted* harness (`logits` against `tokens`, no shift) next to the correct one, for 300 steps.\n* **Guard 2, padding counted in training.** Two runs on padded batches, 800 steps each. One counts the `<pad>` targets, the other masks them. Both are then scored on real tokens only.\n* **The real runs.** `baseline` has one head (`t+1`) and its loss is `L1`. `mtp` has two heads (`t+1`, `t+2`) on the same trunk, and its loss is `L1 + L2`. Both use the same initialisation seed and see the same batches in the same order.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "czkw",
+      "name": "train_fn",
+      "code": "def lr_at(step, steps, warm=100):\n    if step < warm:\n        return LR * (step + 1) / warm\n    return LR * (0.1 + 0.45 * (1 + math.cos(math.pi * (step - warm) / max(1, steps - warm))))\n\n\ndef train(n_future, steps=STEPS, seed=0, batch=\"packed\", count_pad=False, loss_fn=None, log_every=25, eval_every=250):\n    torch.manual_seed(seed)\n    model = GPT(replace(CFG, n_future=n_future)).to(dev)\n    opt = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.1, fused=dev == \"cuda\")\n    gen = torch.Generator().manual_seed(seed)  # identical batches across runs with the same seed\n    hist = {\"step\": [], \"train\": [], \"val_step\": [], \"val\": [], \"val_acc\": []}\n    acc, t0 = None, time.time()\n    for step in range(steps):\n        for grp in opt.param_groups:\n            grp[\"lr\"] = lr_at(step, steps)\n        if batch == \"packed\":\n            x, doc = get_batch(train_ids, gen)\n        else:\n            x = get_padded(train_ids, train_spans, torch.randint(len(train_spans[0]), (B,), generator=gen).to(dev))\n            doc = doc_index(x)\n        with torch.autocast(**AMP):\n            h = model(x, doc)\n            if loss_fn is not None:\n                losses = loss_fn(model, h, x).reshape(1)\n            else:\n                losses = torch.stack([lm_loss(head(h), x, k, doc, None if count_pad else PAD)[0]\n                                      for k, head in enumerate(model.heads, 1)])\n        losses.sum().backward()\n        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n        opt.step()\n        opt.zero_grad(set_to_none=True)\n        acc = losses.detach() if acc is None else acc + losses.detach()\n        if (step + 1) % log_every == 0:\n            hist[\"step\"].append(step + 1)\n            hist[\"train\"].append((acc / log_every).tolist())\n            acc = None\n        if eval_every and ((step + 1) % eval_every == 0 or step == 0):\n            vl, va = evaluate(model)\n            hist[\"val_step\"].append(step + 1); hist[\"val\"].append(vl); hist[\"val_acc\"].append(va)\n    hist[\"seconds\"] = time.time() - t0\n    return model, hist\n\n\ndef smooth(a, w=4):\n    a = np.asarray(a, dtype=float)\n    return np.convolve(np.pad(a, (w - 1, 0), mode=\"edge\"), np.ones(w) / w, mode=\"valid\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "rnrM",
+      "name": "guard_shift",
+      "code": "def unshifted_loss(model, h, x):\n    lg = model.heads[0](h)\n    return F.cross_entropy(lg.reshape(-1, CFG.V).float(), x.reshape(-1))  # BUG: the target is the input itself\n\n\n_m_bug, guard_bug = train(1, steps=300, loss_fn=unshifted_loss, eval_every=0)\n_m_ok, guard_ok = train(1, steps=300, eval_every=0)\nwith torch.no_grad(), torch.autocast(**AMP):\n    _p = _m_bug.heads[0](_m_bug(xb, docb)).argmax(-1)\ncopy_rate = (_p == xb).float().mean().item()\ndel _m_bug, _m_ok\n\n_fig, _ax = plt.subplots(figsize=(7.5, 3.4))\n_ax.plot(guard_bug[\"step\"], [v[0] for v in guard_bug[\"train\"]], color=\"#e11d48\", label=\"unshifted: logits vs tokens (bug)\")\n_ax.plot(guard_ok[\"step\"], [v[0] for v in guard_ok[\"train\"]], color=\"#2563eb\", label=\"shifted: logits[:, :-1] vs tokens[:, 1:]\")\n_ax.axhline(math.log(CFG.V), color=\"gray\", ls=\":\", lw=1)\n_ax.set(xlabel=\"step\", ylabel=\"train loss (nats)\", title=\"A shift in the wrong direction produces a beautiful loss curve\", ylim=(0, 9.5))\n_ax.legend()\n_fig.tight_layout()\nmo.vstack([_fig, mo.md(\n    f\"After 300 steps the unshifted run reports **{guard_bug['train'][-1][0]:.3f}** nats, against **{guard_ok['train'][-1][0]:.3f}** for the correct harness. \"\n    f\"It has learned nothing about language: its argmax equals the **input** token at {copy_rate:.1%} of positions. Position `t` can see token `t`, so copying is enough. \"\n    \"The curve looks great and raises no exception, which is why the shift is printed as strings in item 2.\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "uPxi",
+      "name": "guard_pad",
+      "code": "_m_cnt, pad_hist_cnt = train(1, steps=800, batch=\"padded\", count_pad=True, eval_every=0)\n_m_msk, pad_hist_msk = train(1, steps=800, batch=\"padded\", count_pad=False, eval_every=0)\n_rep_cnt, _rep_msk = padding_report(_m_cnt), padding_report(_m_msk)\npad_train_df = pd.DataFrame({\n    \"training counted <pad> (bug)\": [pad_hist_cnt[\"train\"][-1][0], _rep_cnt[\"loss\"][0], _rep_cnt[\"loss\"][1]],\n    \"training masked <pad>\": [pad_hist_msk[\"train\"][-1][0], _rep_msk[\"loss\"][0], _rep_msk[\"loss\"][1]],\n}, index=[\"reported training loss (last 25 steps)\", \"validation loss, <pad> targets counted\", \"validation loss on real tokens only (the truth)\"])\ndel _m_cnt, _m_msk\nmo.vstack([mo.md(\"**Guard 2 · padding counted during training** (800 steps on padded batches)\"), pad_train_df.round(4), mo.md(\n    f\"The run that counts padding reports a training loss of **{pad_train_df.iloc[0, 0]:.3f}**, against {pad_train_df.iloc[0, 1]:.3f} for the masked run. That looks \"\n    f\"{pad_train_df.iloc[0, 1] - pad_train_df.iloc[0, 0]:.2f} nats better, but on real tokens the two models score {pad_train_df.iloc[2, 0]:.3f} and {pad_train_df.iloc[2, 1]:.3f}. \"\n    \"`<pad> → <pad>` is trivially predictable, so once it is learned it is nearly free and drags the mean down. The loss looks better than the model is.\")])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "LNgI",
+      "name": "train_baseline",
+      "code": "baseline, hist_base = train(1)\nmo.md(f\"`baseline` (1 head) trained for {STEPS:,} steps in {hist_base['seconds']:.0f}s · final validation `L1 = {hist_base['val'][-1][0]:.4f}`\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "qKCc",
+      "name": "train_mtp",
+      "code": "mtp, hist_mtp = train(2)\nmo.md(f\"`mtp` (2 heads) trained for {STEPS:,} steps in {hist_mtp['seconds']:.0f}s · final validation `L1 = {hist_mtp['val'][-1][0]:.4f}`, `L2 = {hist_mtp['val'][-1][1]:.4f}`\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "dYNX",
+      "name": "p2_md",
+      "code": "mo.md(r\"\"\"\n# Part 2 · One extra head\n\nHead 2 is a second `Linear(D, V)` reading the **same final hidden state** as head 1. Its targets are `tokens[:, 2:]` against `logits[:, :-2]`, with the same `<pad>` and story-boundary masking. A head-2 target is dropped when `t+2` falls in the next story, which covers twice as many positions as head 1's boundary mask. The training loss is `L1 + L2`.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "aeSg",
+      "name": "p2_curves",
+      "code": "_st = np.array(hist_mtp[\"step\"])\n_tr = np.array(hist_mtp[\"train\"])\n_L1, _L2 = smooth(_tr[:, 0]), smooth(_tr[:, 1])\n_Lb = smooth(np.array(hist_base[\"train\"])[:, 0])\n\n_fig, _ax = plt.subplots(1, 3, figsize=(15, 4.2))\n_ax[0].plot(_st, _L1, color=\"#db2777\", label=\"mtp · head 1 (t+1)\")\n_ax[0].plot(_st, _L2, color=\"#d97706\", label=\"mtp · head 2 (t+2)\")\n_ax[0].plot(_st, _Lb, color=\"#2563eb\", ls=\"--\", lw=1, label=\"baseline · head 1\")\n_ax[0].plot(_st, _L1 + _L2, color=\"#6b7280\", lw=1, label=\"mtp · L1 + L2\")\n_ax[0].axhline(math.log(CFG.V), color=\"gray\", ls=\":\", lw=1)\n_ax[0].set(xlabel=\"step\", ylabel=\"train loss (nats)\", title=\"Per-head training loss\", ylim=(0, 2 * math.log(CFG.V) + 0.5))\n_ax[0].legend(fontsize=8)\n_ax[1].plot(_st, _L1, color=\"#db2777\", label=\"head 1\")\n_ax[1].plot(_st, _L2, color=\"#d97706\", label=\"head 2\")\n_ax[1].plot(_st, _Lb, color=\"#2563eb\", ls=\"--\", lw=1, label=\"baseline\")\n_ax[1].set(xlabel=\"step\", ylabel=\"train loss (nats)\", title=\"Zoom on the tail\", xlim=(_st[len(_st) // 5], _st[-1]))\n_ax[1].set_ylim(min(_L1[len(_st) // 5:].min(), _Lb[len(_st) // 5:].min()) - 0.1, _L2[len(_st) // 5:].max() + 0.1)\n_ax[1].legend(fontsize=8)\n_ax[2].plot(_st, _L2 - _L1, color=\"#7c3aed\", label=\"L2 − L1 (nats)\")\n_ax[2].set(xlabel=\"step\", ylabel=\"gap (nats)\", title=\"How far head 2 trails head 1\")\n_axb = _ax[2].twinx()\n_axb.plot(_st, _L2 / _L1, color=\"#059669\", label=\"L2 / L1\")\n_axb.set_ylabel(\"ratio L2 / L1\")\n_ax[2].legend(loc=\"upper left\", fontsize=8); _axb.legend(loc=\"lower right\", fontsize=8)\n_fig.tight_layout()\n_fig",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "Xgdd",
+      "name": "p2_table",
+      "code": "_vb, _vm = np.array(hist_base[\"val\"]), np.array(hist_mtp[\"val\"])\n_ab, _am = np.array(hist_base[\"val_acc\"]), np.array(hist_mtp[\"val_acc\"])\nval_table = pd.DataFrame({\"step\": hist_mtp[\"val_step\"], \"baseline L1\": _vb[:, 0], \"mtp L1\": _vm[:, 0], \"mtp L2\": _vm[:, 1],\n                          \"mtp L1+L2\": _vm.sum(1), \"L2 − L1\": _vm[:, 1] - _vm[:, 0], \"L2 / L1\": _vm[:, 1] / _vm[:, 0],\n                          \"head 1 acc\": _am[:, 0], \"head 2 acc\": _am[:, 1]})\nmo.vstack([mo.md(\"**Validation loss (nats) and top-1 accuracy over training**, on 20 fixed validation batches with correct masking\"), val_table.round(4)])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "ipyQ",
+      "name": "p2_final",
+      "code": "@torch.no_grad()\ndef draft_stats(model, n_batches=40, seed=321):\n    \"\"\"Head 2 at t drafts token t+2. Head 1 at t+1 verifies it (greedy). Acceptance = how often they agree.\"\"\"\n    g = torch.Generator().manual_seed(seed)\n    agree = right2 = right1 = cnt = 0\n    for _ in range(n_batches):\n        x, doc = get_batch(val_ids, g)\n        with torch.autocast(**AMP):\n            h = model(x, doc)\n            p1, p2 = model.heads[0](h).argmax(-1), model.heads[1](h).argmax(-1)\n        T = x.size(1)\n        ok = doc[:, 2:] == doc[:, :-2]                       # t and t+2 in the same story\n        draft, verify, truth = p2[:, :T - 2], p1[:, 1:T - 1], x[:, 2:]\n        agree += ((draft == verify) & ok).sum().item()\n        right2 += ((draft == truth) & ok).sum().item()\n        right1 += ((verify == truth) & ok).sum().item()\n        cnt += ok.sum().item()\n    return {\"acceptance: head-2 draft == head-1 greedy at t+1\": agree / cnt,\n            \"head 2 draft correct\": right2 / cnt, \"head 1 (at t+1) correct\": right1 / cnt}\n\n\n(bl1,), (ba1,) = evaluate(baseline, n_batches=60)\n(ml1, ml2), (ma1, ma2) = evaluate(mtp, n_batches=60)\ndrafts = draft_stats(mtp)\nfinal_df = pd.DataFrame({\n    \"loss (nats)\": [bl1, ml1, ml2, ml1 + ml2],\n    \"perplexity\": [math.exp(bl1), math.exp(ml1), math.exp(ml2), float(\"nan\")],\n    \"top-1 accuracy\": [ba1, ma1, ma2, float(\"nan\")],\n}, index=[\"baseline · head 1\", \"mtp · head 1 (L1)\", \"mtp · head 2 (L2)\", \"mtp · L1 + L2\"])\nmo.vstack([mo.md(\"**Final validation**, 60 fixed batches\"), final_df.round(4),\n           mo.md(\"**Head 2 as a draft model** (greedy self-speculation on validation windows)\"),\n           pd.Series(drafts, name=\"rate\").to_frame().round(4)])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "aRHY",
+      "name": "p2_sample",
+      "code": "@torch.no_grad()\ndef sample(model, prompt=\"Once upon a time\", n=80, temp=0.8, seed=0):\n    torch.manual_seed(seed)\n    x = torch.tensor([tok.encode(prompt).ids], device=dev)\n    for _ in range(n):\n        with torch.autocast(**AMP):\n            lg = model.heads[0](model(x[:, -CFG.T:]))[0, -1].float()\n        x = torch.cat([x, torch.multinomial(torch.softmax(lg / temp, -1), 1)[None]], 1)\n        if x[0, -1] == EOS:\n            break\n    return tok.decode(x[0].tolist())\n\n\nmo.md(f\"\"\"**Samples** (head 1, temperature 0.8), to check the trunk learned language and not something degenerate\n\n* `baseline`: {sample(baseline)}\n* `mtp`: {sample(mtp)}\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "UdeJ",
+      "name": "recheck",
+      "code": "pad_trained = padding_report(baseline)\npack_trained = packing_report(mtp)\n_pc = pack_trained[\"head 1\"]\nmo.vstack([\n    mo.md(\"## Items 3 and 4 again, on the trained models\"),\n    mo.md(\"**Padding** (item 3), untrained `model0` vs trained `baseline`\"),\n    pd.concat({\"untrained\": padding_frame(pad_untrained), \"trained\": padding_frame(pad_trained)}, axis=1).round(4),\n    mo.md(f\"\"\"Trained, the unmasked mean is {pad_trained['loss'][0]:.3f} against {pad_trained['loss'][1]:.3f} masked. This model never saw a `<pad>` target in training, so a `<pad>` target is a surprise here and counting it makes the loss *worse*. Guard 2 shows the other direction: once a model trains on counted `<pad>` targets, they become nearly free and make the loss look *better*. Either way, `<pad>` targets move a number that should describe only real text. The wrong denominator still under-reports by the real-token fraction.\"\"\"),\n    mo.md(\"**Packing** (item 4), trained `mtp`, both heads\"),\n    pack_trained.round(4),\n    mo.md(f\"\"\"Trained, a boundary target costs **{_pc['mean loss of the boundary targets alone']:.2f}** nats against {_pc['mean loss of every other target']:.2f} for the rest. Predicting the first token of an unrelated story from the end of another one is close to guessing, since attention cannot see across the boundary. Leaving those {B} targets in moves the loss from {_pc['loss, boundary masked']:.4f} to {_pc['loss, boundary not masked']:.4f}. Training on them as well would push gradients towards \"unrelated things follow `<eos>`\". Head 2 loses twice as many targets ({int(pack_trained.loc['targets counted, boundary not masked', 'head 2'] - pack_trained.loc['targets counted, boundary masked', 'head 2'])}), because both `<eos>` and the token before it reach into story B.\"\"\"),\n])",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": false,
+        "disabled": false,
+        "expand_output": false
+      }
+    },
+    {
+      "id": "fYnF",
+      "name": "writeup",
+      "code": "_gap0 = val_table[\"L2 − L1\"].iloc[1]\n_gapN = val_table[\"L2 − L1\"].iloc[-1]\n_gmax_i = int(val_table[\"L2 − L1\"].idxmax())\n_drop1 = val_table[\"mtp L1\"].iloc[1] - val_table[\"mtp L1\"].iloc[-1]\n_drop2 = val_table[\"mtp L2\"].iloc[1] - val_table[\"mtp L2\"].iloc[-1]\n_tg = np.array(hist_mtp[\"train\"]); _tg = _tg[:, 1] - _tg[:, 0]\n_open = hist_mtp[\"step\"][int(np.argmax(_tg >= 0.9 * _gapN))]\n_pc = pack_trained[\"head 1\"]\nmo.md(f\"\"\"\n# Write-up\n\n## Part 1 · the seven numbers\n\n| # | check | result |\n|---|---|---|\n| 1 | tensor shapes | `tokens [{B}, {CFG.T}]` → `hidden [{B}, {CFG.T}, {CFG.d}]` → `logits [{B}, {CFG.T}, {CFG.V}]` → loss inputs `[{N:,}, {CFG.V}]` vs `[{N:,}]` → scalar |\n| 2 | the shift, as strings | inputs and targets line up one token apart in the item 2 table; the `<eos> → next story` target shows as `✗` |\n| 3 | padding: contributing tokens | **{pad_untrained['targets counted'][0]:,} → {pad_untrained['targets counted'][1]:,}** once `<pad>` targets are masked ({(pad_x == PAD).float().mean().item():.1%} of the batch is padding) |\n| 4 | packing: loss before → after the boundary mask (trained, head 1) | **{_pc['loss, boundary not masked']:.4f} → {_pc['loss, boundary masked']:.4f}**; a boundary target costs {_pc['mean loss of the boundary targets alone']:.2f} nats against {_pc['mean loss of every other target']:.2f} for the others (untrained: {pack_untrained.loc['loss, boundary not masked', 'head 1']:.4f} → {pack_untrained.loc['loss, boundary masked', 'head 1']:.4f}) |\n| 5 | untrained perplexity | **{ppl0:,.0f}** against `V = {CFG.V:,}` (loss {l0:.4f}, `ln V = {math.log(CFG.V):.4f}`) |\n| 6 | head parameters, tied vs untied | **{counts['tied']:,} vs {counts['untied']:,}**: tying saves `V·D = {head_params:,}` ({head_params / counts['untied']:.1%}) |\n| 7 | peak memory of the loss, ordinary vs chunked | **{mem['ordinary MiB']:,.1f} MiB vs {mem['chunked MiB']:,.1f} MiB, {mem['ratio']:.1f}× less**, identical loss and gradients (at `B={B}`; {sweep_df['ratio'].iloc[-1]:.0f}× at `B={sweep_df['B'].iloc[-1]}`) |\n\nTwo failures from the warning were reproduced on purpose. The unshifted harness trains to **{guard_bug['train'][-1][0]:.3f}** nats in 300 steps by copying its input ({copy_rate:.1%} of argmaxes equal the input token). Counting `<pad>` in training reports a loss {pad_train_df.iloc[0, 1] - pad_train_df.iloc[0, 0]:.2f} nats better than masking, while the two models are within {abs(pad_train_df.iloc[2, 0] - pad_train_df.iloc[2, 1]):.3f} nats of each other on real tokens.\n\n## Part 2 · the two losses\n\n| final validation | head 1 (`t+1`) | head 2 (`t+2`) | sum |\n|---|---:|---:|---:|\n| `mtp` loss | **{ml1:.4f}** | **{ml2:.4f}** | **{ml1 + ml2:.4f}** |\n| perplexity | {math.exp(ml1):.2f} | {math.exp(ml2):.2f} | |\n| top-1 accuracy | {ma1:.1%} | {ma2:.1%} | |\n| `baseline` (one head) | {bl1:.4f} | | |\n\n**What happens to head 2's loss over training.** Both heads start at `ln V ≈ {math.log(CFG.V):.2f}` with no gap ({val_table['L2 − L1'].iloc[0]:.3f} nats at step 1). The gap opens fast: in the training log it reaches 90% of its final size by step **{_open}**. It peaks at **{val_table['L2 − L1'].iloc[_gmax_i]:.2f}** nats at step {val_table['step'].iloc[_gmax_i]}, then stays almost constant: {_gap0:.2f} at step {val_table['step'].iloc[1]}, {_gapN:.2f} at the end. From step {val_table['step'].iloc[1]} on, head 1 falls by {_drop1:.2f} nats and head 2 by {_drop2:.2f}, nearly the same amount. So head 2 is not learning more slowly. It runs a fixed ~1 nat behind and never catches up. Because L1 keeps falling while the gap does not, the **ratio** `L2 / L1` rises from {val_table['L2 / L1'].iloc[1]:.2f} to {val_table['L2 / L1'].iloc[-1]:.2f}. In relative terms head 2 looks worse and worse, even though in absolute terms it keeps pace.\n\n**Why.** Head 2 must predict token `t+2` without seeing token `t+1`, so it has to average over every `t+1` that could come next. Its best possible loss is the entropy `H(x_{{t+2}} | x_{{≤t}})`, and that is at least `H(x_{{t+1}} | x_{{≤t}})`, because the unseen token adds uncertainty. For the first few dozen steps both heads learn only token frequencies, and the frequency of token `t+2` is the same as that of `t+1`, so the losses match. As soon as the model uses context, head 1 profits from the sharpest dependency in text, the one on the token right before it (finishing a word or a fixed phrase: `\" Once upon a\" → \" time\"`). Head 2 gets only what survives one unseen token. That is the ~1 nat that opens early. After that, the trunk's improvements (who the story is about, what happened, grammar) help both heads about equally, which is why the gap stays flat instead of shrinking. The gap measures the extra entropy of looking two tokens ahead, not under-training.\n\n**Effect on head 1.** With the extra head, head 1 ends at {ml1:.4f} against {bl1:.4f} for the baseline ({ml1 - bl1:+.4f} nats). The trunk is the same size and now has to serve two objectives, so at {counts['block'] * CFG.L / 1e6:.1f}M trunk parameters and {STEPS:,} steps the extra supervision does {\"not pay for itself in next-token loss\" if ml1 > bl1 else \"help next-token loss slightly\"}. The MTP literature reports its training gains at much larger scale.\n\n**As a draft head.** Used greedily for self-speculation, head 2's draft matches head 1's verified token at `t+1` **{drafts['acceptance: head-2 draft == head-1 greedy at t+1']:.1%}** of the time. That acceptance rate, not the loss, decides whether MTP pays at inference.\n\"\"\")",
+      "code_hash": null,
+      "config": {
+        "column": null,
+        "hide_code": true,
+        "disabled": false,
+        "expand_output": true
+      }
+    }
+  ]
+}
