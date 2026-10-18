@@ -1,6 +1,6 @@
 # LLM loss harness + multi-token prediction, from scratch
 
-A small GPT (8 layers, 8 heads, `D=256`, BPE vocabulary `V=8,192`, context `T=256`) trained on TinyStories, used as a test bench for the few lines between `model(tokens)` and the scalar loss, where many silent training bugs live. Part 1 makes that path correct and observable: the shift, padding and packing masks, perplexity at init, tied vs untied heads, and a chunked cross-entropy that cuts the loss's peak memory 12.8×. Part 2 adds a DeepSeek-V3-style second output head that predicts token `t+2`, and measures what it costs and what it buys.
+A small GPT (8 layers, 8 heads, `D=256`, BPE vocabulary `V=8,192`, context `T=256`) trained on TinyStories, used as a test bench for the few lines between `model(tokens)` and the scalar loss, where many silent training bugs live. Part 1 makes that path correct and observable: the shift, padding and packing masks, perplexity at init, tied vs untied heads, and a chunked cross-entropy that cuts the loss's peak memory 12.8×. Part 2 adds a second output head that predicts token `t+2` from the shared trunk (parallel multi-token prediction, as in [Gloeckle et al., 2024](https://arxiv.org/abs/2404.19737)), and measures what it costs and what it buys.
 
 *Built as the Session 9 assignment of The School of AI's ERA V5 course.*
 
